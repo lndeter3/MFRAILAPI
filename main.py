@@ -1,8 +1,8 @@
 """
-mfreedownload API — async file relay
+mfreedownload API — async file hosting relay
 """
 from __future__ import annotations
-import asyncio, os, re, time, uuid
+import asyncio, os, time, uuid
 from typing import Optional
 
 from fastapi import (
@@ -15,14 +15,13 @@ from fastapi.responses import (
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
-from curl_cffi import requests as _cffi
 
 import tasks as T
 
 # ──────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="mfreedownload API",
-    version="2.1.0",
+    version="2.0.0",
     description="Async file relay · zero-config upload with auto account rotation",
     docs_url=None,
     redoc_url=None,
@@ -38,6 +37,8 @@ def _check_key(request: Request):
     if k != API_KEY:
         raise HTTPException(403, "invalid api key")
 
+# ──────────────────────────────────────────────────────────────────────────
+# Schemas
 # ──────────────────────────────────────────────────────────────────────────
 class WipeBody(BaseModel):
     purge_trash: bool = True
@@ -217,11 +218,10 @@ curl __BASE__/jobs/abc-123...
 #   {
 #     "filename": "video.mp4",
 #     "size": 128394832,
-#     "link":            "https://.../file/xxxx",
-#     "short_download":  "/d/xxxx",
-#     "short_stream":    "/s/xxxx",
-#     "direct":          "https://.../direct/..."
-#   }
+#     "link":   "https://.../file/xxxx",
+#     "direct": "https://.../direct/xxxx"
+#   },
+#   ...
 # ]
 </code></pre>
 
@@ -233,29 +233,14 @@ curl __BASE__/jobs/abc-123...
     Uploada uno o più file. <span class="badge">async</span><br>
     L'API si occupa in autonomia di: creazione account temporanei,
     autenticazione, controllo quota, rotation quando serve, retry e generazione
-    dei link finali.
+    dei link finali (normal + direct).
   </p>
   <div class="kv"><div class="k">files</div><div class="v">multipart · uno o più file</div></div>
   <div class="kv"><div class="k">parallel</div><div class="v">form · default 4 (1–16)</div></div>
-</div>
-
-<h2>🔗 Short links</h2>
-
-<div class="ep">
-  <div><span class="method m-get">GET</span><span class="path">/d/{id}</span></div>
   <p class="desc">
-    <b>Download diretto</b>. Redirect verso il CDN. Link permanente:
-    il CDN dietro cambia da solo alla scadenza.<br>
-    Es: <code>__BASE__/d/oewoa6wx7rvbm7p</code>
-  </p>
-</div>
-
-<div class="ep">
-  <div><span class="method m-get">GET</span><span class="path">/s/{id}</span></div>
-  <p class="desc">
-    <b>Streaming</b> per VLC, Wuffy, IINA, browser video ecc.
-    Supporta Range requests.<br>
-    Es: <code>vlc __BASE__/s/oewoa6wx7rvbm7p</code>
+    Ritorna <code>202 Accepted</code> con <code>job_id</code>.<br>
+    Segui il progresso con <code>GET /jobs/{job_id}</code> o via SSE
+    <code>GET /jobs/{job_id}/stream</code>.
   </p>
 </div>
 
@@ -263,7 +248,7 @@ curl __BASE__/jobs/abc-123...
 
 <div class="ep">
   <div><span class="method m-get">GET</span><span class="path">/jobs/{job_id}</span></div>
-  <p class="desc">Stato e log completo. Al termine include <code>result.files</code>.</p>
+  <p class="desc">Stato e log completo. Al termine include <code>result.files</code> con tutti i link.</p>
 </div>
 
 <div class="ep">
@@ -280,7 +265,7 @@ curl __BASE__/jobs/abc-123...
   <p class="desc">Lista tutti i job. Filtri: <code>?status=</code>, <code>?limit=</code>.</p>
 </div>
 
-<h2>📚 Links archive</h2>
+<h2>🔗 Links archive</h2>
 
 <div class="ep">
   <div><span class="method m-get">GET</span><span class="path">/links</span></div>
@@ -332,12 +317,19 @@ async def upload(
     files: list[UploadFile] = File(...),
     parallel: int = Form(T.PARALLEL_DEFAULT),
 ):
+    """
+    Endpoint unico. Fa tutto in autonomia:
+    - crea/riusa account interni
+    - login, wipe, upload con rotation se quota piena
+    - genera link normal + direct per ogni file
+    """
     _check_key(request)
     parallel = max(1, min(16, parallel))
 
     if not files:
         raise HTTPException(400, "no files provided")
 
+    # salva i file su disco temporaneo
     jid     = str(uuid.uuid4())
     job_dir = T.UPLOAD_DIR / jid
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -347,12 +339,14 @@ async def upload(
         dest.write_bytes(await uf.read())
         saved.append(str(dest))
 
+    # crea il job (id predefinito per riusare la stessa dir)
     T._jobs[jid] = {
         "id": jid, "kind": "upload", "status": "pending",
         "progress": [], "result": None, "error": None,
         "created": time.time(), "updated": time.time(),
         "meta": {"files": len(saved)},
     }
+    # lancia il task auto-managed (registra account se serve, ruota, ecc.)
     asyncio.create_task(T._task_upload_auto(jid, saved, parallel))
 
     return JSONResponse(status_code=202, content={
@@ -362,66 +356,6 @@ async def upload(
         "poll":   f"/jobs/{jid}",
         "stream": f"/jobs/{jid}/stream",
     })
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Short links (/d/<id>, /s/<id>) — resolve CDN via scraping
-# ══════════════════════════════════════════════════════════════════════════
-_DIRECT_RE = re.compile(r'https?://download[^"\'<>\s]+', re.IGNORECASE)
-
-# cache in-memory: quickkey → (direct_url, expires_epoch)
-_DIRECT_CACHE: dict[str, tuple[str, float]] = {}
-_CACHE_TTL   = 300  # 5 min
-
-
-async def _resolve_direct(quickkey: str) -> str:
-    """
-    Prende il vero URL CDN (download1327.mediafire.com/...) per un quickkey
-    scrappando la pagina share pubblica.
-    """
-    hit = _DIRECT_CACHE.get(quickkey)
-    if hit and hit[1] > time.time():
-        return hit[0]
-
-    url = f"https://www.mediafire.com/file/{quickkey}"
-    try:
-        async with _cffi.AsyncSession(impersonate="chrome") as s:
-            r = await s.get(url, allow_redirects=True, timeout=20)
-            html = r.text
-    except Exception as e:
-        raise HTTPException(502, f"cannot resolve file: {e}")
-
-    m = _DIRECT_RE.search(html)
-    if not m:
-        raise HTTPException(404, "file not found or link expired")
-
-    direct = m.group(0).replace("&amp;", "&")
-    _DIRECT_CACHE[quickkey] = (direct, time.time() + _CACHE_TTL)
-    return direct
-
-
-@app.get("/d/{quickkey}", tags=["links"],
-         summary="Short download link (redirect to CDN)")
-async def short_download(quickkey: str, request: Request):
-    """
-    Redirect 302 verso il vero URL CDN.
-    Uso: https://<host>/d/<quickkey>
-    """
-    _check_key(request)
-    direct = await _resolve_direct(quickkey)
-    return RedirectResponse(url=direct, status_code=302)
-
-
-@app.get("/s/{quickkey}", tags=["links"],
-         summary="Short stream link (redirect for VLC/Wuffy/players)")
-async def short_stream(quickkey: str, request: Request):
-    """
-    Redirect 302 al CDN, per streaming (VLC, Wuffy, browser video, …).
-    Il CDN supporta Range requests, quindi seek/scrub funziona.
-    """
-    _check_key(request)
-    direct = await _resolve_direct(quickkey)
-    return RedirectResponse(url=direct, status_code=302)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -499,17 +433,12 @@ async def all_links(
 ):
     _check_key(request)
     links = T.load_links()
+    # rimuovi metadati interni sensibili
     clean = [
         {k: v for k, v in l.items()
          if k not in ("account_email", "account_password")}
         for l in links
     ]
-    # aggiungi short links se manca
-    for l in clean:
-        qk = l.get("quickkey")
-        if qk:
-            l.setdefault("short_download", f"/d/{qk}")
-            l.setdefault("short_stream",   f"/s/{qk}")
     total = len(clean)
     clean = clean[offset: offset + limit]
     return {"total": total, "offset": offset, "limit": limit, "links": clean}
