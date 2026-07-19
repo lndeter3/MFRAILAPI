@@ -1,29 +1,42 @@
 """
-Job manager asincrono.
-Ogni job ha: id, status, progress, result/error.
-Supporta: register, login, upload (multi-file + auto-rotation).
-I job vengono tenuti in memoria (dict); per Railway con più repliche
-sostituire con Redis.
+tasks.py — job manager asincrono per mfreedownload API
+=======================================================
+
+Gestisce:
+- registrazione automatica account interni
+- login e mantenimento sessioni in memoria
+- upload multi-file con auto-rotation quando la quota si riempie
+- wipe account
+- job store in-memory con progress log
 """
 from __future__ import annotations
-import asyncio, os, time, uuid
+import asyncio, json as _json, os, time, uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from mediafire import (
     MediaFire, MFError, AuthError, QuotaError,
     register, fmt_size, sha256_file, to_thread,
 )
 
-# ──────────────────────────────────────────────────────────────────────────
-# Store account persistente minimo (file di testo, stesso del CLI)
-# ──────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+#  Persistenza minima su file (Railway: usa un volume per non perdere)
+# ══════════════════════════════════════════════════════════════════════════
 ACCOUNTS_FILE = os.environ.get("ACCOUNTS_FILE", "mf_accounts.txt")
 LINKS_FILE    = os.environ.get("LINKS_FILE",    "mf_links.txt")
+
+PARALLEL_DEFAULT = int(os.environ.get("UPLOAD_PARALLEL", "4"))
+UPLOAD_DIR       = Path(os.environ.get("UPLOAD_DIR", "/tmp/mf_uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Soglia minima di spazio libero per considerare un account "usabile"
+MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", 10 * 1024 * 1024))  # 10 MB
+
 
 def save_account(email: str, password: str):
     with open(ACCOUNTS_FILE, "a", encoding="utf-8") as f:
         f.write(f"{email}:{password}\n")
+
 
 def load_accounts() -> list[dict]:
     out = []
@@ -35,10 +48,11 @@ def load_accounts() -> list[dict]:
             out.append({"email": e.strip(), "password": pw.strip()})
     return out
 
-import json as _json
+
 def append_link(record: dict):
     with open(LINKS_FILE, "a", encoding="utf-8") as f:
         f.write(_json.dumps(record) + "\n")
+
 
 def load_links() -> list[dict]:
     p = Path(LINKS_FILE)
@@ -49,10 +63,12 @@ def load_links() -> list[dict]:
         except Exception: pass
     return out
 
-# ──────────────────────────────────────────────────────────────────────────
-# Job store
-# ──────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Job store (in-memory)
+# ══════════════════════════════════════════════════════════════════════════
 _jobs: dict[str, dict] = {}
+
 
 def _new_job(kind: str, meta: dict | None = None) -> str:
     jid = str(uuid.uuid4())
@@ -60,7 +76,7 @@ def _new_job(kind: str, meta: dict | None = None) -> str:
         "id":       jid,
         "kind":     kind,
         "status":   "pending",   # pending | running | done | error
-        "progress": [],           # lista di stringhe (log)
+        "progress": [],
         "result":   None,
         "error":    None,
         "created":  time.time(),
@@ -69,37 +85,48 @@ def _new_job(kind: str, meta: dict | None = None) -> str:
     }
     return jid
 
+
 def get_job(jid: str) -> Optional[dict]:
     return _jobs.get(jid)
+
 
 def list_jobs() -> list[dict]:
     return sorted(_jobs.values(), key=lambda j: j["created"], reverse=True)
 
+
 def _upd(jid: str, **kw):
-    j = _jobs[jid]; j.update(kw); j["updated"] = time.time()
+    j = _jobs.get(jid)
+    if not j: return
+    j.update(kw); j["updated"] = time.time()
+
 
 def _log(jid: str, msg: str):
-    _jobs[jid]["progress"].append({"t": time.time(), "msg": msg})
-    _jobs[jid]["updated"] = time.time()
+    j = _jobs.get(jid)
+    if not j: return
+    j["progress"].append({"t": time.time(), "msg": msg})
+    j["updated"] = time.time()
 
-# ──────────────────────────────────────────────────────────────────────────
-# Session store (in-memory; chiave = email)
-# ──────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Session store (in-memory; chiave = email)
+# ══════════════════════════════════════════════════════════════════════════
 _sessions: dict[str, dict] = {}   # email → MediaFire.to_state()
 
+
 async def _get_mf(email: str) -> Optional[MediaFire]:
-    """Ricostruisce un MediaFire autenticato dallo stato salvato."""
     state = _sessions.get(email)
     if not state: return None
     return await MediaFire.from_state(state)
+
 
 def _save_mf(mf: MediaFire):
     if mf._email:
         _sessions[mf._email] = mf.to_state()
 
-# ──────────────────────────────────────────────────────────────────────────
-# TASK: register
-# ──────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TASK: register (crea un account, resta salvato in _sessions)
+# ══════════════════════════════════════════════════════════════════════════
 async def _task_register(jid: str):
     _upd(jid, status="running")
     try:
@@ -108,27 +135,34 @@ async def _task_register(jid: str):
         save_account(creds["email"], creds["password"])
         _log(jid, f"account created: {creds['email']}")
 
-        # login automatico + wipe
         mf = MediaFire()
         await mf.login(creds["email"], creds["password"], use_cache=False)
         _log(jid, "login ok")
-        stats = await mf.wipe_root("myfiles", purge_trash=True)
-        _log(jid, f"wipe: {stats['folders']} folders, {stats['files']} files")
+        try:
+            stats = await mf.wipe_root("myfiles", purge_trash=True)
+            _log(jid, f"wipe: {stats['folders']} folders, {stats['files']} files")
+        except Exception as e:
+            _log(jid, f"wipe warning: {e}")
         _save_mf(mf)
         await mf.close()
 
-        _upd(jid, status="done", result=creds)
+        _upd(jid, status="done", result={
+            "email":    creds["email"],
+            "password": creds["password"],
+        })
     except Exception as e:
         _upd(jid, status="error", error=str(e))
+
 
 def spawn_register() -> str:
     jid = _new_job("register")
     asyncio.create_task(_task_register(jid))
     return jid
 
-# ──────────────────────────────────────────────────────────────────────────
-# TASK: login
-# ──────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TASK: login
+# ══════════════════════════════════════════════════════════════════════════
 async def _task_login(jid: str, email: str, password: str):
     _upd(jid, status="running")
     try:
@@ -139,10 +173,10 @@ async def _task_login(jid: str, email: str, password: str):
         _save_mf(mf)
         await mf.close()
         _upd(jid, status="done", result={
-            "email": email,
-            "used":  used,
-            "total": total,
-            "free":  max(0, total - used),
+            "email":     email,
+            "used":      used,
+            "total":     total,
+            "free":      max(0, total - used),
             "used_fmt":  fmt_size(used),
             "total_fmt": fmt_size(total),
             "free_fmt":  fmt_size(max(0, total - used)),
@@ -151,30 +185,88 @@ async def _task_login(jid: str, email: str, password: str):
     except Exception as e:
         _upd(jid, status="error", error=str(e))
 
+
 def spawn_login(email: str, password: str) -> str:
     jid = _new_job("login", {"email": email})
     asyncio.create_task(_task_login(jid, email, password))
     return jid
 
-# ──────────────────────────────────────────────────────────────────────────
-# TASK: upload (multi-file, auto-rotation)
-# ──────────────────────────────────────────────────────────────────────────
-PARALLEL_DEFAULT = int(os.environ.get("UPLOAD_PARALLEL", "4"))
-UPLOAD_DIR       = Path(os.environ.get("UPLOAD_DIR", "/tmp/mf_uploads"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Auto account picker (riusa o crea)
+# ══════════════════════════════════════════════════════════════════════════
+async def _pick_or_create_account(jid: str) -> MediaFire:
+    """
+    Priorità:
+      1. Sessioni già in memoria con free > MIN_FREE_BYTES
+      2. Account salvati su file → login + verifica free
+      3. Nuova registrazione automatica
+    """
+    # 1) sessioni in memoria
+    for email in list(_sessions.keys()):
+        mf = await _get_mf(email)
+        if not mf: continue
+        try:
+            free = await mf.free_bytes()
+            if free > MIN_FREE_BYTES:
+                _log(jid, f"reusing in-memory session · free {fmt_size(free)}")
+                return mf
+            await mf.close()
+        except Exception:
+            try: await mf.close()
+            except Exception: pass
+
+    # 2) account salvati su file
+    for acc in load_accounts():
+        if acc["email"] in _sessions:
+            continue  # già provato sopra
+        try:
+            mf = MediaFire()
+            await mf.login(acc["email"], acc["password"], use_cache=False)
+            free = await mf.free_bytes()
+            _save_mf(mf)
+            if free > MIN_FREE_BYTES:
+                _log(jid, f"logged into stored account · free {fmt_size(free)}")
+                return mf
+            await mf.close()
+        except Exception:
+            continue
+
+    # 3) crea nuovo
+    _log(jid, "no usable account · creating a fresh one")
+    def _log_fn(m): _log(jid, m)
+    creds = await register(log_fn=_log_fn)
+    save_account(creds["email"], creds["password"])
+    mf = MediaFire()
+    await mf.login(creds["email"], creds["password"], use_cache=False)
+    try:
+        await mf.wipe_root("myfiles", purge_trash=True)
+    except Exception: pass
+    _save_mf(mf)
+    _log(jid, "fresh account ready")
+    return mf
+
 
 async def _rotate_account(mf: MediaFire, jid: str) -> None:
-    _log(jid, "quota piena → creo nuovo account")
+    """Ruota su un nuovo account (quota piena)."""
+    _log(jid, "rotating: current account is full")
     def _log_fn(m): _log(jid, m)
     creds = await register(log_fn=_log_fn)
     save_account(creds["email"], creds["password"])
     await mf.reset_session()
     await mf.login(creds["email"], creds["password"], use_cache=False)
-    _log(jid, f"ruotato a {creds['email']}")
-    stats = await mf.wipe_root("myfiles", purge_trash=True)
-    _log(jid, f"wipe nuovo account: {stats['folders']} dir + {stats['files']} file")
+    _log(jid, f"rotated to fresh account")
+    try:
+        stats = await mf.wipe_root("myfiles", purge_trash=True)
+        _log(jid, f"wiped: {stats['folders']} dirs + {stats['files']} files")
+    except Exception as e:
+        _log(jid, f"wipe warning: {e}")
     _save_mf(mf)
 
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Core: upload con rotation
+# ══════════════════════════════════════════════════════════════════════════
 async def _upload_with_rotation(
     mf: MediaFire,
     paths: list[Path],
@@ -184,14 +276,18 @@ async def _upload_with_rotation(
 ) -> list[dict]:
 
     results: list[dict] = []
-    queue = list(paths)
+    queue       = list(paths)
     total_files = len(paths)
     done_count  = 0
 
     while queue:
-        free = await mf.free_bytes()
-        _log(jid, f"account={mf._email} free={fmt_size(free)}")
+        try:
+            free = await mf.free_bytes()
+        except Exception:
+            free = 0
+        _log(jid, f"free space: {fmt_size(free)}")
 
+        # partiziona: cosa entra ora vs cosa rimandare
         batch: list[Path] = []
         rest:  list[Path] = []
         running = 0
@@ -203,11 +299,12 @@ async def _upload_with_rotation(
             else:
                 rest.append(p)
 
+        # se non entra nulla → rotate
         if not batch:
             await _rotate_account(mf, jid)
             continue
 
-        sem = asyncio.Semaphore(parallel)
+        sem      = asyncio.Semaphore(parallel)
         counters = {"done": done_count}
 
         async def _run_one(path: Path) -> dict:
@@ -216,10 +313,7 @@ async def _upload_with_rotation(
                 size  = path.stat().st_size
                 _log(jid, f"↑ {fname} ({fmt_size(size)})")
                 try:
-                    uploaded_bytes = 0
-                    def _prog(b):
-                        nonlocal uploaded_bytes
-                        uploaded_bytes = b
+                    def _prog(_b): pass  # progress interno per file (silenzioso)
 
                     r = await mf.upload_file(path, folder=folder, on_progress=_prog)
                     qk = r["quickkey"]
@@ -244,10 +338,11 @@ async def _upload_with_rotation(
                     }
                     append_link(record)
                     counters["done"] += 1
-                    _log(jid, f"✓ {fname} → {link} [{counters['done']}/{total_files}]")
+                    _log(jid, f"✓ {fname} → {link} "
+                              f"[{counters['done']}/{total_files}]")
                     return record
                 except QuotaError as e:
-                    _log(jid, f"quota su {fname}: {e}")
+                    _log(jid, f"quota on {fname}: {e}")
                     return {"file": str(path), "error": "quota", "_quota": True}
                 except Exception as e:
                     _log(jid, f"✗ {fname}: {e}")
@@ -271,6 +366,10 @@ async def _upload_with_rotation(
 
     return results
 
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TASK: upload (con email/password espliciti — internal)
+# ══════════════════════════════════════════════════════════════════════════
 async def _task_upload(
     jid: str,
     email: str,
@@ -281,31 +380,35 @@ async def _task_upload(
     _upd(jid, status="running")
     paths = [Path(p) for p in file_paths]
 
-    # costruisci/recupera sessione
     mf = await _get_mf(email)
     if mf is None:
-        _upd(jid, status="error", error=f"nessuna sessione per {email}"); return
+        _upd(jid, status="error", error=f"no session for {email}")
+        return
     try:
         await mf.user_info()
     except Exception:
-        _upd(jid, status="error", error="sessione scaduta, ri-logga"); return
+        _upd(jid, status="error", error="session expired, please re-login")
+        try: await mf.close()
+        except Exception: pass
+        return
 
     try:
         results = await _upload_with_rotation(mf, paths, jid, folder, parallel)
         _save_mf(mf)
         await mf.close()
-        ok  = [r for r in results if "link" in r and r.get("link")]
+        ok  = [r for r in results if r.get("link")]
         err = [r for r in results if r.get("error")]
         _upd(jid, status="done", result={
-            "total":     len(paths),
-            "uploaded":  len(ok),
-            "errors":    len(err),
-            "files":     results,
+            "total":    len(paths),
+            "uploaded": len(ok),
+            "errors":   len(err),
+            "files":    results,
         })
     except Exception as e:
         _upd(jid, status="error", error=str(e))
         try: await mf.close()
         except Exception: pass
+
 
 def spawn_upload(
     email: str,
@@ -317,14 +420,80 @@ def spawn_upload(
     asyncio.create_task(_task_upload(jid, email, file_paths, folder, parallel))
     return jid
 
-# ──────────────────────────────────────────────────────────────────────────
-# TASK: wipe
-# ──────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TASK: upload FULL-AUTO (usato dall'endpoint pubblico /upload)
+# ══════════════════════════════════════════════════════════════════════════
+async def _task_upload_auto(jid: str, file_paths: list[str], parallel: int):
+    """
+    Upload full-auto: sceglie/crea l'account, esegue upload con rotation,
+    ritorna solo link puliti (nessuna credenziale esposta).
+    """
+    _upd(jid, status="running")
+    paths = [Path(p) for p in file_paths]
+
+    try:
+        mf = await _pick_or_create_account(jid)
+    except Exception as e:
+        _upd(jid, status="error", error=f"account setup failed: {e}")
+        return
+
+    try:
+        results = await _upload_with_rotation(mf, paths, jid, "myfiles", parallel)
+        _save_mf(mf)
+        await mf.close()
+
+        # output pulito: nessuna credenziale
+        clean_files = []
+        for r in results:
+            if r.get("link"):
+                clean_files.append({
+                    "filename": r.get("filename") or Path(r["file"]).name,
+                    "size":     r.get("size"),
+                    "size_fmt": r.get("size_fmt"),
+                    "link":     r.get("link"),
+                    "direct":   r.get("direct"),
+                })
+            else:
+                clean_files.append({
+                    "filename": Path(r.get("file", "?")).name,
+                    "error":    r.get("error", "unknown"),
+                })
+        ok  = [f for f in clean_files if "link" in f]
+        err = [f for f in clean_files if "error" in f]
+
+        _upd(jid, status="done", result={
+            "total":    len(paths),
+            "uploaded": len(ok),
+            "errors":   len(err),
+            "files":    clean_files,
+        })
+    except Exception as e:
+        _upd(jid, status="error", error=str(e))
+        try: await mf.close()
+        except Exception: pass
+
+    # cleanup dir temp
+    try:
+        job_dir = UPLOAD_DIR / jid
+        if job_dir.exists():
+            for f in job_dir.iterdir():
+                try: f.unlink()
+                except Exception: pass
+            try: job_dir.rmdir()
+            except Exception: pass
+    except Exception: pass
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TASK: wipe
+# ══════════════════════════════════════════════════════════════════════════
 async def _task_wipe(jid: str, email: str, purge_trash: bool):
     _upd(jid, status="running")
     mf = await _get_mf(email)
     if mf is None:
-        _upd(jid, status="error", error=f"nessuna sessione per {email}"); return
+        _upd(jid, status="error", error=f"no session for {email}")
+        return
     try:
         stats = await mf.wipe_root("myfiles", purge_trash=purge_trash)
         _save_mf(mf)
@@ -332,76 +501,102 @@ async def _task_wipe(jid: str, email: str, purge_trash: bool):
         _upd(jid, status="done", result=stats)
     except Exception as e:
         _upd(jid, status="error", error=str(e))
+        try: await mf.close()
+        except Exception: pass
+
 
 def spawn_wipe(email: str, purge_trash: bool = True) -> str:
     jid = _new_job("wipe", {"email": email})
     asyncio.create_task(_task_wipe(jid, email, purge_trash))
     return jid
 
-# ──────────────────────────────────────────────────────────────────────────
-# helpers diretti (sincroni dall'API, non job)
-# ──────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Helpers diretti (chiamati sincronamente dall'API)
+# ══════════════════════════════════════════════════════════════════════════
 async def direct_info(email: str) -> dict:
     mf = await _get_mf(email)
     if not mf: raise RuntimeError(f"no session for {email}")
-    info = (await mf.user_info()).get("user_info", {})
-    used, total = await mf.storage()
-    _save_mf(mf)
-    await mf.close()
-    return {
-        "email":       info.get("email"),
-        "display_name":info.get("display_name"),
-        "used":        used,
-        "total":       total,
-        "free":        max(0, total - used),
-        "used_fmt":    fmt_size(used),
-        "total_fmt":   fmt_size(total),
-        "free_fmt":    fmt_size(max(0, total - used)),
-        "storage_pct": round(used / total * 100, 2) if total else 0,
-    }
+    try:
+        info        = (await mf.user_info()).get("user_info", {})
+        used, total = await mf.storage()
+        _save_mf(mf)
+        return {
+            "email":       info.get("email"),
+            "display_name":info.get("display_name"),
+            "used":        used,
+            "total":       total,
+            "free":        max(0, total - used),
+            "used_fmt":    fmt_size(used),
+            "total_fmt":   fmt_size(total),
+            "free_fmt":    fmt_size(max(0, total - used)),
+            "storage_pct": round(used / total * 100, 2) if total else 0,
+        }
+    finally:
+        await mf.close()
+
 
 async def direct_list(email: str, folder_key: str = "myfiles") -> list[dict]:
     mf = await _get_mf(email)
     if not mf: raise RuntimeError(f"no session for {email}")
-    items = await mf.folder_list_all(folder_key)
-    _save_mf(mf)
-    await mf.close()
-    out = []
-    for ct, it in items:
-        if ct == "folders":
-            out.append({"type": "folder", "key": it.get("folderkey"),
-                        "name": it.get("name"), "created": it.get("created")})
-        else:
-            out.append({"type": "file", "key": it.get("quickkey"),
-                        "name": it.get("filename"),
-                        "size": int(it.get("size", 0)),
-                        "size_fmt": fmt_size(int(it.get("size", 0))),
-                        "created": it.get("created")})
-    return out
+    try:
+        items = await mf.folder_list_all(folder_key)
+        _save_mf(mf)
+        out = []
+        for ct, it in items:
+            if ct == "folders":
+                out.append({
+                    "type":    "folder",
+                    "key":     it.get("folderkey"),
+                    "name":    it.get("name"),
+                    "created": it.get("created"),
+                })
+            else:
+                sz = int(it.get("size", 0))
+                out.append({
+                    "type":     "file",
+                    "key":      it.get("quickkey"),
+                    "name":     it.get("filename"),
+                    "size":     sz,
+                    "size_fmt": fmt_size(sz),
+                    "created":  it.get("created"),
+                })
+        return out
+    finally:
+        await mf.close()
+
 
 async def direct_links(email: str, quickkey: str) -> dict:
     mf = await _get_mf(email)
     if not mf: raise RuntimeError(f"no session for {email}")
-    normal = await mf.share(quickkey)
-    direct = await mf.direct(quickkey)
-    _save_mf(mf)
-    await mf.close()
-    return {"quickkey": quickkey, "normal": normal, "direct": direct}
+    try:
+        normal = await mf.share(quickkey)
+        direct = await mf.direct(quickkey)
+        _save_mf(mf)
+        return {"quickkey": quickkey, "normal": normal, "direct": direct}
+    finally:
+        await mf.close()
+
 
 async def direct_mkdir(email: str, name: str, parent: str = "myfiles") -> dict:
     mf = await _get_mf(email)
     if not mf: raise RuntimeError(f"no session for {email}")
-    r = await mf.folder_create(name, parent)
-    fk = r.get("folder_key") or (r.get("created_folder") or {}).get("folder_key")
-    _save_mf(mf)
-    await mf.close()
-    return {"folder_key": fk, "name": name, "parent": parent}
+    try:
+        r  = await mf.folder_create(name, parent)
+        fk = r.get("folder_key") or (r.get("created_folder") or {}).get("folder_key")
+        _save_mf(mf)
+        return {"folder_key": fk, "name": name, "parent": parent}
+    finally:
+        await mf.close()
+
 
 async def direct_delete(email: str, key: str, kind: str = "file") -> dict:
     mf = await _get_mf(email)
     if not mf: raise RuntimeError(f"no session for {email}")
-    if kind == "folder": await mf.folder_delete(key)
-    else:                await mf.file_delete(key)
-    _save_mf(mf)
-    await mf.close()
-    return {"deleted": key, "type": kind}
+    try:
+        if kind == "folder": await mf.folder_delete(key)
+        else:                await mf.file_delete(key)
+        _save_mf(mf)
+        return {"deleted": key, "type": kind}
+    finally:
+        await mf.close()
