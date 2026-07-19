@@ -115,27 +115,17 @@ def _save_mf(mf: MediaFire):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Warm-up account (fondamentale per evitare errore 169 su account nuovi)
+# Warm-up account
 # ══════════════════════════════════════════════════════════════════════════
 async def _warmup_account(mf: MediaFire, jid: str):
-    """
-    Dopo la verifica email il backend impiega qualche secondo ad "abilitare"
-    davvero l'account per l'upload. Senza questo warm-up si prende [169].
-    """
     _log(jid, f"warming up account ({WARMUP_DELAY:.1f}s)…")
     await asyncio.sleep(WARMUP_DELAY)
-    try:
-        await mf.user_info()
-    except Exception as e:
-        _log(jid, f"warmup user_info: {e}")
-    try:
-        await mf.folder_content("myfiles")
-    except Exception as e:
-        _log(jid, f"warmup folder_content: {e}")
-    try:
-        await mf._action_token(force_new=True)
-    except Exception as e:
-        _log(jid, f"warmup action_token: {e}")
+    try: await mf.user_info()
+    except Exception as e: _log(jid, f"warmup user_info: {e}")
+    try: await mf.folder_content("myfiles")
+    except Exception as e: _log(jid, f"warmup folder_content: {e}")
+    try: await mf._action_token(force_new=True)
+    except Exception as e: _log(jid, f"warmup action_token: {e}")
     await asyncio.sleep(1.5)
 
 
@@ -212,11 +202,6 @@ def spawn_login(email: str, password: str) -> str:
 # Auto account picker
 # ══════════════════════════════════════════════════════════════════════════
 async def _pick_or_create_account(jid: str) -> MediaFire:
-    """
-    1. Sessioni in memoria con free > MIN_FREE_BYTES
-    2. Account salvati → login + verifica
-    3. Nuova registrazione
-    """
     for email in list(_sessions.keys()):
         mf = await _get_mf(email)
         if not mf: continue
@@ -452,12 +437,16 @@ async def _task_upload_auto(jid: str, file_paths: list[str], parallel: int):
         clean_files = []
         for r in results:
             if r.get("link"):
+                qk = r.get("quickkey", "")
                 clean_files.append({
-                    "filename": r.get("filename") or Path(r["file"]).name,
-                    "size":     r.get("size"),
-                    "size_fmt": r.get("size_fmt"),
-                    "link":     r.get("link"),
-                    "direct":   r.get("direct"),
+                    "filename":       r.get("filename") or Path(r["file"]).name,
+                    "size":           r.get("size"),
+                    "size_fmt":       r.get("size_fmt"),
+                    "quickkey":       qk,
+                    "link":           r.get("link"),
+                    "direct":         r.get("direct"),
+                    "short_download": f"/d/{qk}",
+                    "short_stream":   f"/s/{qk}",
                 })
             else:
                 clean_files.append({
@@ -478,6 +467,7 @@ async def _task_upload_auto(jid: str, file_paths: list[str], parallel: int):
         try: await mf.close()
         except Exception: pass
 
+    # cleanup dir temp
     try:
         job_dir = UPLOAD_DIR / jid
         if job_dir.exists():
