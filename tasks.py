@@ -1,0 +1,407 @@
+"""
+Job manager asincrono.
+Ogni job ha: id, status, progress, result/error.
+Supporta: register, login, upload (multi-file + auto-rotation).
+I job vengono tenuti in memoria (dict); per Railway con più repliche
+sostituire con Redis.
+"""
+from __future__ import annotations
+import asyncio, os, time, uuid
+from pathlib import Path
+from typing import Any, Optional
+
+from mediafire import (
+    MediaFire, MFError, AuthError, QuotaError,
+    register, fmt_size, sha256_file, to_thread,
+)
+
+# ──────────────────────────────────────────────────────────────────────────
+# Store account persistente minimo (file di testo, stesso del CLI)
+# ──────────────────────────────────────────────────────────────────────────
+ACCOUNTS_FILE = os.environ.get("ACCOUNTS_FILE", "mf_accounts.txt")
+LINKS_FILE    = os.environ.get("LINKS_FILE",    "mf_links.txt")
+
+def save_account(email: str, password: str):
+    with open(ACCOUNTS_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{email}:{password}\n")
+
+def load_accounts() -> list[dict]:
+    out = []
+    p = Path(ACCOUNTS_FILE)
+    if not p.exists(): return out
+    for ln in p.read_text(encoding="utf-8").splitlines():
+        if ":" in ln:
+            e, pw = ln.split(":", 1)
+            out.append({"email": e.strip(), "password": pw.strip()})
+    return out
+
+import json as _json
+def append_link(record: dict):
+    with open(LINKS_FILE, "a", encoding="utf-8") as f:
+        f.write(_json.dumps(record) + "\n")
+
+def load_links() -> list[dict]:
+    p = Path(LINKS_FILE)
+    if not p.exists(): return []
+    out = []
+    for ln in p.read_text(encoding="utf-8").splitlines():
+        try: out.append(_json.loads(ln))
+        except Exception: pass
+    return out
+
+# ──────────────────────────────────────────────────────────────────────────
+# Job store
+# ──────────────────────────────────────────────────────────────────────────
+_jobs: dict[str, dict] = {}
+
+def _new_job(kind: str, meta: dict | None = None) -> str:
+    jid = str(uuid.uuid4())
+    _jobs[jid] = {
+        "id":       jid,
+        "kind":     kind,
+        "status":   "pending",   # pending | running | done | error
+        "progress": [],           # lista di stringhe (log)
+        "result":   None,
+        "error":    None,
+        "created":  time.time(),
+        "updated":  time.time(),
+        "meta":     meta or {},
+    }
+    return jid
+
+def get_job(jid: str) -> Optional[dict]:
+    return _jobs.get(jid)
+
+def list_jobs() -> list[dict]:
+    return sorted(_jobs.values(), key=lambda j: j["created"], reverse=True)
+
+def _upd(jid: str, **kw):
+    j = _jobs[jid]; j.update(kw); j["updated"] = time.time()
+
+def _log(jid: str, msg: str):
+    _jobs[jid]["progress"].append({"t": time.time(), "msg": msg})
+    _jobs[jid]["updated"] = time.time()
+
+# ──────────────────────────────────────────────────────────────────────────
+# Session store (in-memory; chiave = email)
+# ──────────────────────────────────────────────────────────────────────────
+_sessions: dict[str, dict] = {}   # email → MediaFire.to_state()
+
+async def _get_mf(email: str) -> Optional[MediaFire]:
+    """Ricostruisce un MediaFire autenticato dallo stato salvato."""
+    state = _sessions.get(email)
+    if not state: return None
+    return await MediaFire.from_state(state)
+
+def _save_mf(mf: MediaFire):
+    if mf._email:
+        _sessions[mf._email] = mf.to_state()
+
+# ──────────────────────────────────────────────────────────────────────────
+# TASK: register
+# ──────────────────────────────────────────────────────────────────────────
+async def _task_register(jid: str):
+    _upd(jid, status="running")
+    try:
+        def _log_fn(m): _log(jid, m)
+        creds = await register(log_fn=_log_fn)
+        save_account(creds["email"], creds["password"])
+        _log(jid, f"account created: {creds['email']}")
+
+        # login automatico + wipe
+        mf = MediaFire()
+        await mf.login(creds["email"], creds["password"], use_cache=False)
+        _log(jid, "login ok")
+        stats = await mf.wipe_root("myfiles", purge_trash=True)
+        _log(jid, f"wipe: {stats['folders']} folders, {stats['files']} files")
+        _save_mf(mf)
+        await mf.close()
+
+        _upd(jid, status="done", result=creds)
+    except Exception as e:
+        _upd(jid, status="error", error=str(e))
+
+def spawn_register() -> str:
+    jid = _new_job("register")
+    asyncio.create_task(_task_register(jid))
+    return jid
+
+# ──────────────────────────────────────────────────────────────────────────
+# TASK: login
+# ──────────────────────────────────────────────────────────────────────────
+async def _task_login(jid: str, email: str, password: str):
+    _upd(jid, status="running")
+    try:
+        mf = MediaFire()
+        await mf.login(email, password, use_cache=False)
+        save_account(email, password)
+        used, total = await mf.storage()
+        _save_mf(mf)
+        await mf.close()
+        _upd(jid, status="done", result={
+            "email": email,
+            "used":  used,
+            "total": total,
+            "free":  max(0, total - used),
+            "used_fmt":  fmt_size(used),
+            "total_fmt": fmt_size(total),
+            "free_fmt":  fmt_size(max(0, total - used)),
+        })
+        _log(jid, f"login ok · free {fmt_size(max(0, total-used))}")
+    except Exception as e:
+        _upd(jid, status="error", error=str(e))
+
+def spawn_login(email: str, password: str) -> str:
+    jid = _new_job("login", {"email": email})
+    asyncio.create_task(_task_login(jid, email, password))
+    return jid
+
+# ──────────────────────────────────────────────────────────────────────────
+# TASK: upload (multi-file, auto-rotation)
+# ──────────────────────────────────────────────────────────────────────────
+PARALLEL_DEFAULT = int(os.environ.get("UPLOAD_PARALLEL", "4"))
+UPLOAD_DIR       = Path(os.environ.get("UPLOAD_DIR", "/tmp/mf_uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+async def _rotate_account(mf: MediaFire, jid: str) -> None:
+    _log(jid, "quota piena → creo nuovo account")
+    def _log_fn(m): _log(jid, m)
+    creds = await register(log_fn=_log_fn)
+    save_account(creds["email"], creds["password"])
+    await mf.reset_session()
+    await mf.login(creds["email"], creds["password"], use_cache=False)
+    _log(jid, f"ruotato a {creds['email']}")
+    stats = await mf.wipe_root("myfiles", purge_trash=True)
+    _log(jid, f"wipe nuovo account: {stats['folders']} dir + {stats['files']} file")
+    _save_mf(mf)
+
+async def _upload_with_rotation(
+    mf: MediaFire,
+    paths: list[Path],
+    jid: str,
+    folder: str = "myfiles",
+    parallel: int = PARALLEL_DEFAULT,
+) -> list[dict]:
+
+    results: list[dict] = []
+    queue = list(paths)
+    total_files = len(paths)
+    done_count  = 0
+
+    while queue:
+        free = await mf.free_bytes()
+        _log(jid, f"account={mf._email} free={fmt_size(free)}")
+
+        batch: list[Path] = []
+        rest:  list[Path] = []
+        running = 0
+        for p in queue:
+            try: sz = p.stat().st_size
+            except Exception: sz = 0
+            if running + sz <= free and free > 0:
+                batch.append(p); running += sz
+            else:
+                rest.append(p)
+
+        if not batch:
+            await _rotate_account(mf, jid)
+            continue
+
+        sem = asyncio.Semaphore(parallel)
+        counters = {"done": done_count}
+
+        async def _run_one(path: Path) -> dict:
+            async with sem:
+                fname = path.name
+                size  = path.stat().st_size
+                _log(jid, f"↑ {fname} ({fmt_size(size)})")
+                try:
+                    uploaded_bytes = 0
+                    def _prog(b):
+                        nonlocal uploaded_bytes
+                        uploaded_bytes = b
+
+                    r = await mf.upload_file(path, folder=folder, on_progress=_prog)
+                    qk = r["quickkey"]
+                    try: link   = await mf.share(qk)
+                    except Exception: link = ""
+                    try: direct = await mf.direct(qk)
+                    except Exception: direct = ""
+
+                    record = {
+                        "file":             str(path),
+                        "filename":         fname,
+                        "quickkey":         qk,
+                        "method":           r["method"],
+                        "size":             size,
+                        "size_fmt":         fmt_size(size),
+                        "hash":             r["hash"],
+                        "link":             link,
+                        "direct":           direct,
+                        "account_email":    mf._email,
+                        "account_password": mf._password,
+                        "timestamp":        int(time.time()),
+                    }
+                    append_link(record)
+                    counters["done"] += 1
+                    _log(jid, f"✓ {fname} → {link} [{counters['done']}/{total_files}]")
+                    return record
+                except QuotaError as e:
+                    _log(jid, f"quota su {fname}: {e}")
+                    return {"file": str(path), "error": "quota", "_quota": True}
+                except Exception as e:
+                    _log(jid, f"✗ {fname}: {e}")
+                    return {"file": str(path), "error": str(e)}
+
+        tasks     = [asyncio.create_task(_run_one(p)) for p in batch]
+        batch_res = await asyncio.gather(*tasks)
+
+        quota_hits: list[Path] = []
+        for path, r in zip(batch, batch_res):
+            if r.get("_quota"):
+                quota_hits.append(path)
+            else:
+                results.append(r)
+
+        done_count = counters["done"]
+        queue = quota_hits + rest
+
+        if quota_hits or rest:
+            await _rotate_account(mf, jid)
+
+    return results
+
+async def _task_upload(
+    jid: str,
+    email: str,
+    file_paths: list[str],
+    folder: str,
+    parallel: int,
+):
+    _upd(jid, status="running")
+    paths = [Path(p) for p in file_paths]
+
+    # costruisci/recupera sessione
+    mf = await _get_mf(email)
+    if mf is None:
+        _upd(jid, status="error", error=f"nessuna sessione per {email}"); return
+    try:
+        await mf.user_info()
+    except Exception:
+        _upd(jid, status="error", error="sessione scaduta, ri-logga"); return
+
+    try:
+        results = await _upload_with_rotation(mf, paths, jid, folder, parallel)
+        _save_mf(mf)
+        await mf.close()
+        ok  = [r for r in results if "link" in r and r.get("link")]
+        err = [r for r in results if r.get("error")]
+        _upd(jid, status="done", result={
+            "total":     len(paths),
+            "uploaded":  len(ok),
+            "errors":    len(err),
+            "files":     results,
+        })
+    except Exception as e:
+        _upd(jid, status="error", error=str(e))
+        try: await mf.close()
+        except Exception: pass
+
+def spawn_upload(
+    email: str,
+    file_paths: list[str],
+    folder: str = "myfiles",
+    parallel: int = PARALLEL_DEFAULT,
+) -> str:
+    jid = _new_job("upload", {"email": email, "files": len(file_paths)})
+    asyncio.create_task(_task_upload(jid, email, file_paths, folder, parallel))
+    return jid
+
+# ──────────────────────────────────────────────────────────────────────────
+# TASK: wipe
+# ──────────────────────────────────────────────────────────────────────────
+async def _task_wipe(jid: str, email: str, purge_trash: bool):
+    _upd(jid, status="running")
+    mf = await _get_mf(email)
+    if mf is None:
+        _upd(jid, status="error", error=f"nessuna sessione per {email}"); return
+    try:
+        stats = await mf.wipe_root("myfiles", purge_trash=purge_trash)
+        _save_mf(mf)
+        await mf.close()
+        _upd(jid, status="done", result=stats)
+    except Exception as e:
+        _upd(jid, status="error", error=str(e))
+
+def spawn_wipe(email: str, purge_trash: bool = True) -> str:
+    jid = _new_job("wipe", {"email": email})
+    asyncio.create_task(_task_wipe(jid, email, purge_trash))
+    return jid
+
+# ──────────────────────────────────────────────────────────────────────────
+# helpers diretti (sincroni dall'API, non job)
+# ──────────────────────────────────────────────────────────────────────────
+async def direct_info(email: str) -> dict:
+    mf = await _get_mf(email)
+    if not mf: raise RuntimeError(f"no session for {email}")
+    info = (await mf.user_info()).get("user_info", {})
+    used, total = await mf.storage()
+    _save_mf(mf)
+    await mf.close()
+    return {
+        "email":       info.get("email"),
+        "display_name":info.get("display_name"),
+        "used":        used,
+        "total":       total,
+        "free":        max(0, total - used),
+        "used_fmt":    fmt_size(used),
+        "total_fmt":   fmt_size(total),
+        "free_fmt":    fmt_size(max(0, total - used)),
+        "storage_pct": round(used / total * 100, 2) if total else 0,
+    }
+
+async def direct_list(email: str, folder_key: str = "myfiles") -> list[dict]:
+    mf = await _get_mf(email)
+    if not mf: raise RuntimeError(f"no session for {email}")
+    items = await mf.folder_list_all(folder_key)
+    _save_mf(mf)
+    await mf.close()
+    out = []
+    for ct, it in items:
+        if ct == "folders":
+            out.append({"type": "folder", "key": it.get("folderkey"),
+                        "name": it.get("name"), "created": it.get("created")})
+        else:
+            out.append({"type": "file", "key": it.get("quickkey"),
+                        "name": it.get("filename"),
+                        "size": int(it.get("size", 0)),
+                        "size_fmt": fmt_size(int(it.get("size", 0))),
+                        "created": it.get("created")})
+    return out
+
+async def direct_links(email: str, quickkey: str) -> dict:
+    mf = await _get_mf(email)
+    if not mf: raise RuntimeError(f"no session for {email}")
+    normal = await mf.share(quickkey)
+    direct = await mf.direct(quickkey)
+    _save_mf(mf)
+    await mf.close()
+    return {"quickkey": quickkey, "normal": normal, "direct": direct}
+
+async def direct_mkdir(email: str, name: str, parent: str = "myfiles") -> dict:
+    mf = await _get_mf(email)
+    if not mf: raise RuntimeError(f"no session for {email}")
+    r = await mf.folder_create(name, parent)
+    fk = r.get("folder_key") or (r.get("created_folder") or {}).get("folder_key")
+    _save_mf(mf)
+    await mf.close()
+    return {"folder_key": fk, "name": name, "parent": parent}
+
+async def direct_delete(email: str, key: str, kind: str = "file") -> dict:
+    mf = await _get_mf(email)
+    if not mf: raise RuntimeError(f"no session for {email}")
+    if kind == "folder": await mf.folder_delete(key)
+    else:                await mf.file_delete(key)
+    _save_mf(mf)
+    await mf.close()
+    return {"deleted": key, "type": kind}
