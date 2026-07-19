@@ -1,12 +1,13 @@
 """
-MediaFire async client — estratto e pulito dal CLI originale.
-Espone MediaFire, TempMail, register(), upload_with_rotation().
+MediaFire async client — con retry robusto su errore 169 e warm-up account.
+Espone MediaFire, TempMail, register().
 """
 from __future__ import annotations
 import asyncio, hashlib, json, mimetypes, pickle, random, re
 import string, time
 from pathlib import Path
 from typing import Optional, Callable
+from urllib.parse import quote
 
 import requests as _http
 from curl_cffi import requests as cffi
@@ -160,7 +161,6 @@ async def register(log_fn=None) -> dict:
     """
     Crea un account MediaFire completo (TempMail + registrazione + verifica).
     log_fn(msg: str) opzionale per progressi.
-    Ritorna {"email", "password", "first_name", "last_name"}.
     """
     def _log(m):
         if log_fn: log_fn(m)
@@ -242,7 +242,6 @@ class MediaFire:
             return False
 
     def to_state(self) -> dict:
-        """Serializza lo stato in un dict JSON-safe (per DB / Redis)."""
         return self._dump()
 
     @classmethod
@@ -354,14 +353,18 @@ class MediaFire:
                 raise MFError(resp.get("error"), msg)
         return resp
 
-    async def _action_token(self) -> str:
-        if (self.action_token_upload
+    # ── action_token con force refresh ────────────────────────────────────
+    async def _action_token(self, force_new: bool = False) -> str:
+        if (not force_new and self.action_token_upload
                 and time.time() < self.action_token_upload_exp - 300):
             return self.action_token_upload
         async with self._lock:
-            if (self.action_token_upload
+            if (not force_new and self.action_token_upload
                     and time.time() < self.action_token_upload_exp - 300):
                 return self.action_token_upload
+            if force_new:
+                self.action_token_upload = None
+                self.action_token_upload_exp = 0
             resp = await self._api("user/get_action_token.php",
                                    type="upload", lifespan=1440)
             tok = resp.get("action_token")
@@ -494,24 +497,46 @@ class MediaFire:
             await asyncio.sleep(interval)
         raise MFError(-1, "poll timeout")
 
+    # ── upload_simple con retry su 169 + URL-encode filename ──────────────
     async def _upload_simple(self, path: Path, fname: str, fk: str,
                               fhash: str, atok: str,
                               on_progress: Callable) -> dict:
         size  = path.stat().st_size
         ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
         with open(path, "rb") as f: data = f.read()
-        r = await self.s.post(
-            f"{API}/upload/simple.php",
-            params={"session_token": self.session_token,
-                    "action_token": atok,
-                    "folder_key": fk, "response_format": "json"},
-            data=data,
-            headers={"Content-Type": "application/octet-stream",
-                     "X-Filehash": fhash, "X-Filename": fname,
-                     "X-Filetype": ctype, "X-Filesize": str(size),
-                     "Origin": APP, "Referer": f"{APP}/"})
+
+        async def _try(atok_use):
+            r = await self.s.post(
+                f"{API}/upload/simple.php",
+                params={"session_token": self.session_token,
+                        "action_token":  atok_use,
+                        "folder_key":    fk,
+                        "response_format": "json"},
+                data=data,
+                headers={"Content-Type": "application/octet-stream",
+                         "x-filehash": fhash,
+                         "x-filename": quote(fname, safe=""),
+                         "x-filetype": ctype,
+                         "x-filesize": str(size),
+                         "Origin": APP, "Referer": f"{APP}/"})
+            try: return r.json().get("response", {})
+            except Exception:
+                raise MFError(-1, f"non-JSON: {r.text[:200]}")
+
+        resp = await _try(atok)
+
+        code = str(resp.get("error", "")) if resp.get("result") == "Error" else ""
+        if code in ("169", "127", "105"):
+            await asyncio.sleep(2.0)
+            atok2 = await self._action_token(force_new=True)
+            resp = await _try(atok2)
+            code = str(resp.get("error", "")) if resp.get("result") == "Error" else ""
+            if code == "169":
+                await asyncio.sleep(3.0)
+                atok3 = await self._action_token(force_new=True)
+                resp = await _try(atok3)
+
         on_progress(size)
-        resp = r.json().get("response", {})
         if resp.get("result") == "Error":
             code = str(resp.get("error")); msg = resp.get("message", "")
             if "storage" in msg.lower() or code in ("131", "159"):
@@ -521,16 +546,24 @@ class MediaFire:
         if not k: raise MFError(-1, "no upload key")
         return await self.upload_poll(k)
 
+    # ── upload_resumable con retry robusto su 169 ─────────────────────────
     async def _upload_resumable(self, path: Path, fname: str, fk: str,
                                  fhash: str, atok: str,
                                  on_progress: Callable) -> dict:
         size   = path.stat().st_size
         ctype  = mimetypes.guess_type(fname)[0] or "application/octet-stream"
         url    = f"{API}/upload/resumable.php"
-        params = {"session_token": self.session_token,
-                  "action_token": atok,
-                  "folder_key": fk, "response_format": "json"}
-        upkey = None; uploaded = 0
+
+        def _params(tok):
+            return {"session_token": self.session_token,
+                    "action_token":  tok,
+                    "folder_key":    fk,
+                    "response_format": "json"}
+
+        cur_atok = atok
+        upkey    = None
+        uploaded = 0
+
         with open(path, "rb") as f:
             uid = 0
             while True:
@@ -539,37 +572,61 @@ class MediaFire:
                 uhash = sha256_bytes(chunk)
                 headers = {
                     "Content-Type": "application/octet-stream",
-                    "X-Filehash": fhash, "X-Filename": fname,
-                    "X-Filetype": ctype, "X-Filesize": str(size),
-                    "X-Unit-Id": str(uid), "X-Unit-Hash": uhash,
-                    "X-Unit-Size": str(len(chunk)),
+                    "x-filehash": fhash,
+                    "x-filename": quote(fname, safe=""),
+                    "x-filetype": ctype,
+                    "x-filesize": str(size),
+                    "x-unit-id":   str(uid),
+                    "x-unit-hash": uhash,
+                    "x-unit-size": str(len(chunk)),
                     "Origin": APP, "Referer": f"{APP}/",
                 }
+
                 data = None
-                for att in range(3):
-                    r = await self.s.post(url, params=params,
-                                          data=chunk, headers=headers)
-                    try: data = r.json(); break
-                    except Exception:
-                        if att == 2: raise MFError(-1, f"chunk {uid} non-JSON")
+                last_err = None
+                success = False
+                for att in range(5):
+                    try:
+                        r = await self.s.post(url, params=_params(cur_atok),
+                                              data=chunk, headers=headers)
+                        try: data = r.json()
+                        except Exception:
+                            last_err = f"non-JSON: {r.text[:200]}"
+                            await asyncio.sleep(1.0 * (att + 1))
+                            continue
+                        resp = data.get("response", {})
+                        if resp.get("result") == "Error":
+                            code = str(resp.get("error"))
+                            last_err = f"[{code}] {resp.get('message','')}"
+                            if code in ("105", "127"):
+                                await self.renew_token()
+                                await asyncio.sleep(1.0)
+                                continue
+                            if code == "169":
+                                await asyncio.sleep(2.0 + att)
+                                cur_atok = await self._action_token(force_new=True)
+                                continue
+                            # errore non-retriable
+                            if "storage" in resp.get("message","").lower() or code in ("131","159"):
+                                raise QuotaError(code, resp.get("message",""))
+                            raise MFError(resp.get("error"), resp.get("message",""))
+                        success = True
+                        break
+                    except (QuotaError, MFError):
+                        raise
+                    except Exception as e:
+                        last_err = str(e)
                         await asyncio.sleep(1.0 * (att + 1))
+
+                if not success:
+                    raise MFError(169, f"chunk {uid} failed after retries: {last_err}")
+
                 resp = data.get("response", {})  # type: ignore
-                if (resp.get("result") == "Error"
-                        and str(resp.get("error")) in ("105", "127")):
-                    await self.renew_token()
-                    params["session_token"] = self.session_token
-                    r = await self.s.post(url, params=params,
-                                          data=chunk, headers=headers)
-                    resp = r.json().get("response", {})
-                if resp.get("result") == "Error":
-                    code = str(resp.get("error")); msg = resp.get("message", "")
-                    if "storage" in msg.lower() or code in ("131", "159"):
-                        raise QuotaError(code, msg)
-                    raise MFError(resp.get("error"), msg)
                 k = resp.get("doupload", {}).get("key")
                 if k: upkey = k
                 uploaded += len(chunk); on_progress(uploaded)
                 uid += 1
+
         if not upkey: raise MFError(-1, "no upload key after chunks")
         return await self.upload_poll(upkey)
 
@@ -577,7 +634,6 @@ class MediaFire:
                           on_progress: Optional[Callable] = None) -> dict:
         """
         Uploada un singolo file. Ritorna dict con quickkey, method, size, hash.
-        on_progress(bytes_done: int) opzionale.
         """
         size  = path.stat().st_size
         fname = path.name
